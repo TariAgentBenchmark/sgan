@@ -8,6 +8,7 @@ def data_loader(args, path):
         path,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
+        cond_len=getattr(args, 'cond_len', 6),
         skip=args.skip,
         delim=args.delim)
 

@@ -7,12 +7,40 @@ from contextlib import contextmanager
 import subprocess
 
 
+def resolve_device(requested=None):
+    """
+    Pick an execution device that works on both Apple Silicon and CUDA hosts.
+    """
+    if requested and requested.lower() != 'auto':
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+def move_batch_to_device(batch, device):
+    return [tensor.to(device) for tensor in batch]
+
+
+def synchronize(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    elif device.type == 'mps':
+        try:
+            torch.mps.synchronize()
+        except AttributeError:
+            # Older torch versions might not expose synchronize on mps
+            pass
+
+
 def int_tuple(s):
     return tuple(int(i) for i in s.split(','))
 
 
 def find_nan(variable, var_name):
-    variable_n = variable.data.cpu().numpy()
+    variable_n = variable.detach().cpu().numpy()
     if np.isnan(variable_n).any():
         exit('%s has nan' % var_name)
 
@@ -32,36 +60,42 @@ def lineno():
 
 def get_total_norm(parameters, norm_type=2):
     if norm_type == float('inf'):
-        total_norm = max(p.grad.data.abs().max() for p in parameters)
+        total_norm = max(
+            p.grad.detach().abs().max() for p in parameters if p.grad is not None
+        )
     else:
         total_norm = 0
         for p in parameters:
-            try:
-                param_norm = p.grad.data.norm(norm_type)
-                total_norm += param_norm**norm_type
-                total_norm = total_norm**(1. / norm_type)
-            except:
+            if p.grad is None:
                 continue
+            param_norm = p.grad.detach().norm(norm_type)
+            total_norm += param_norm**norm_type
+        total_norm = total_norm**(1. / norm_type)
     return total_norm
 
 
 @contextmanager
-def timeit(msg, should_time=True):
+def timeit(msg, device=None, should_time=True):
+    device = device or resolve_device()
     if should_time:
-        torch.cuda.synchronize()
+        if device.type in ('cuda', 'mps'):
+            synchronize(device)
         t0 = time.time()
     yield
     if should_time:
-        torch.cuda.synchronize()
+        if device.type in ('cuda', 'mps'):
+            synchronize(device)
         t1 = time.time()
         duration = (t1 - t0) * 1000.0
         print('%s: %.2f ms' % (msg, duration))
 
 
 def get_gpu_memory():
+    if not torch.cuda.is_available():
+        return 0
     torch.cuda.synchronize()
     opts = [
-        'nvidia-smi', '-q', '--gpu=' + str(1), '|', 'grep', '"Used GPU Memory"'
+        'nvidia-smi', '-q', '--gpu=' + str(0), '|', 'grep', '"Used GPU Memory"'
     ]
     cmd = str.join(' ', opts)
     ps = subprocess.Popen(

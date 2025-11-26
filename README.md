@@ -39,18 +39,20 @@ Our model consists of three key components: Generator (G), Pooling Module (PM) a
   <img src='images/model.png' width='1000px'>
 </div>
 
-## Setup
-All code was developed and tested on Ubuntu 16.04 with Python 3.5 and PyTorch 0.4.
-
-You can setup a virtual environment to run the code like this:
+## Setup (PyTorch 2.x + uv)
+- Tested with Python 3.11 and PyTorch 2.3 on both Apple Silicon (CPU/MPS) and CUDA GPUs.
+- Dependencies are defined in `pyproject.toml` and can be installed with [uv](https://github.com/astral-sh/uv).
 
 ```bash
-python3 -m venv env               # Create a virtual environment
-source env/bin/activate           # Activate virtual environment
-pip install -r requirements.txt   # Install dependencies
-echo $PWD > env/lib/python3.5/site-packages/sgan.pth  # Add current directory to python path
-# Work for a while ...
-deactivate  # Exit virtual environment
+# Create and activate a virtual environment (example uses Python 3.11)
+uv venv .venv --python 3.11
+source .venv/bin/activate
+
+# CPU or Apple Silicon (MPS) build
+uv pip install -e .
+
+# CUDA build (set the right extra index for your CUDA version, e.g. cu121)
+UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121 uv pip install -e .
 ```
 
 ## Pretrained Models
@@ -66,7 +68,8 @@ You can use the script `scripts/evaluate_model.py` to easily run any of the pret
 
 ```bash
 python scripts/evaluate_model.py \
-  --model_path models/sgan-models
+  --model_path models/sgan-models \
+  --device auto  # or mps / cuda / cpu
 ```
 
 ## Training new models

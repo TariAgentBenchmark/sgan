@@ -11,13 +11,28 @@ logger = logging.getLogger(__name__)
 
 
 def seq_collate(data):
-    (obs_seq_list, pred_seq_list, obs_seq_rel_list, pred_seq_rel_list,
-     non_linear_ped_list, loss_mask_list) = zip(*data)
+    (
+        obs_seq_list,
+        pred_seq_list,
+        obs_seq_rel_list,
+        pred_seq_rel_list,
+        non_linear_ped_list,
+        loss_mask_list,
+        subj_obs_list,
+        subj_obs_rel_list,
+        subj_fut_list,
+        subj_fut_rel_list,
+    ) = zip(*data)
 
     _len = [len(seq) for seq in obs_seq_list]
     cum_start_idx = [0] + np.cumsum(_len).tolist()
     seq_start_end = [[start, end]
                      for start, end in zip(cum_start_idx, cum_start_idx[1:])]
+
+    seq_ids = []
+    for i, count in enumerate(_len):
+        seq_ids.extend([i] * count)
+    seq_ids = torch.LongTensor(seq_ids)
 
     # Data format: batch, input_size, seq_len
     # LSTM input format: seq_len, batch, input_size
@@ -28,9 +43,16 @@ def seq_collate(data):
     non_linear_ped = torch.cat(non_linear_ped_list)
     loss_mask = torch.cat(loss_mask_list, dim=0)
     seq_start_end = torch.LongTensor(seq_start_end)
+
+    subj_obs = torch.stack(subj_obs_list, dim=0).permute(2, 0, 1)
+    subj_obs_rel = torch.stack(subj_obs_rel_list, dim=0).permute(2, 0, 1)
+    subj_fut = torch.stack(subj_fut_list, dim=0).permute(2, 0, 1)
+    subj_fut_rel = torch.stack(subj_fut_rel_list, dim=0).permute(2, 0, 1)
+
     out = [
         obs_traj, pred_traj, obs_traj_rel, pred_traj_rel, non_linear_ped,
-        loss_mask, seq_start_end
+        loss_mask, seq_start_end, subj_obs, subj_obs_rel, subj_fut,
+        subj_fut_rel, seq_ids
     ]
 
     return tuple(out)
@@ -71,8 +93,8 @@ def poly_fit(traj, traj_len, threshold):
 class TrajectoryDataset(Dataset):
     """Dataloder for the Trajectory datasets"""
     def __init__(
-        self, data_dir, obs_len=8, pred_len=12, skip=1, threshold=0.002,
-        min_ped=1, delim='\t'
+        self, data_dir, obs_len=8, pred_len=12, cond_len=6, skip=1,
+        threshold=0.002, min_ped=1, delim='\t'
     ):
         """
         Args:
@@ -80,6 +102,7 @@ class TrajectoryDataset(Dataset):
         <frame_id> <ped_id> <x> <y>
         - obs_len: Number of time-steps in input trajectories
         - pred_len: Number of time-steps in output trajectories
+        - cond_len: Number of time-steps of subject future provided as input
         - skip: Number of frames to skip while making the dataset
         - threshold: Minimum error to be considered for non linear traj
         when using a linear predictor
@@ -91,6 +114,7 @@ class TrajectoryDataset(Dataset):
         self.data_dir = data_dir
         self.obs_len = obs_len
         self.pred_len = pred_len
+        self.cond_len = cond_len
         self.skip = skip
         self.seq_len = self.obs_len + self.pred_len
         self.delim = delim
@@ -102,6 +126,10 @@ class TrajectoryDataset(Dataset):
         seq_list_rel = []
         loss_mask_list = []
         non_linear_ped = []
+        subj_obs_list = []
+        subj_obs_rel_list = []
+        subj_fut_list = []
+        subj_fut_rel_list = []
         for path in all_files:
             data = read_file(path, delim)
             frames = np.unique(data[:, 0]).tolist()
@@ -146,17 +174,53 @@ class TrajectoryDataset(Dataset):
                     num_peds_considered += 1
 
                 if num_peds_considered > min_ped:
-                    non_linear_ped += _non_linear_ped
-                    num_peds_in_seq.append(num_peds_considered)
-                    loss_mask_list.append(curr_loss_mask[:num_peds_considered])
-                    seq_list.append(curr_seq[:num_peds_considered])
-                    seq_list_rel.append(curr_seq_rel[:num_peds_considered])
+                    # Trim any preallocated rows for pedestrians that were not fully observed
+                    curr_seq = curr_seq[:num_peds_considered]
+                    curr_seq_rel = curr_seq_rel[:num_peds_considered]
+                    curr_loss_mask = curr_loss_mask[:num_peds_considered]
+                    _non_linear_ped = _non_linear_ped[:num_peds_considered]
+
+                    for subj_idx in range(num_peds_considered):
+                        obj_mask = np.ones(num_peds_considered, dtype=bool)
+                        obj_mask[subj_idx] = False
+                        if np.sum(obj_mask) < 1:
+                            continue
+
+                        subj_obs = curr_seq[subj_idx, :, :self.obs_len]
+                        subj_obs_rel = curr_seq_rel[subj_idx, :, :self.obs_len]
+                        subj_fut = curr_seq[
+                            subj_idx,
+                            :,
+                            self.obs_len:self.obs_len + self.cond_len
+                        ]
+                        subj_fut_rel = curr_seq_rel[
+                            subj_idx,
+                            :,
+                            self.obs_len:self.obs_len + self.cond_len
+                        ]
+
+                        seq_list.append(curr_seq[obj_mask, :, :])
+                        seq_list_rel.append(curr_seq_rel[obj_mask, :, :])
+                        loss_mask_list.append(curr_loss_mask[obj_mask])
+                        non_linear_ped.append(
+                            np.asarray(_non_linear_ped)[obj_mask]
+                        )
+                        num_peds_in_seq.append(np.sum(obj_mask))
+
+                        subj_obs_list.append(subj_obs)
+                        subj_obs_rel_list.append(subj_obs_rel)
+                        subj_fut_list.append(subj_fut)
+                        subj_fut_rel_list.append(subj_fut_rel)
 
         self.num_seq = len(seq_list)
         seq_list = np.concatenate(seq_list, axis=0)
         seq_list_rel = np.concatenate(seq_list_rel, axis=0)
         loss_mask_list = np.concatenate(loss_mask_list, axis=0)
-        non_linear_ped = np.asarray(non_linear_ped)
+        non_linear_ped = np.concatenate(non_linear_ped, axis=0)
+        subj_obs_list = np.asarray(subj_obs_list)
+        subj_obs_rel_list = np.asarray(subj_obs_rel_list)
+        subj_fut_list = np.asarray(subj_fut_list)
+        subj_fut_rel_list = np.asarray(subj_fut_rel_list)
 
         # Convert numpy -> Torch Tensor
         self.obs_traj = torch.from_numpy(
@@ -169,6 +233,10 @@ class TrajectoryDataset(Dataset):
             seq_list_rel[:, :, self.obs_len:]).type(torch.float)
         self.loss_mask = torch.from_numpy(loss_mask_list).type(torch.float)
         self.non_linear_ped = torch.from_numpy(non_linear_ped).type(torch.float)
+        self.subj_obs = torch.from_numpy(subj_obs_list).type(torch.float)
+        self.subj_obs_rel = torch.from_numpy(subj_obs_rel_list).type(torch.float)
+        self.subj_fut = torch.from_numpy(subj_fut_list).type(torch.float)
+        self.subj_fut_rel = torch.from_numpy(subj_fut_rel_list).type(torch.float)
         cum_start_idx = [0] + np.cumsum(num_peds_in_seq).tolist()
         self.seq_start_end = [
             (start, end)
@@ -183,6 +251,8 @@ class TrajectoryDataset(Dataset):
         out = [
             self.obs_traj[start:end, :], self.pred_traj[start:end, :],
             self.obs_traj_rel[start:end, :], self.pred_traj_rel[start:end, :],
-            self.non_linear_ped[start:end], self.loss_mask[start:end, :]
+            self.non_linear_ped[start:end], self.loss_mask[start:end, :],
+            self.subj_obs[index, :], self.subj_obs_rel[index, :],
+            self.subj_fut[index, :], self.subj_fut_rel[index, :]
         ]
         return out

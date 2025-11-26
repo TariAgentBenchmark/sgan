@@ -66,7 +66,7 @@ def l2_loss(pred_traj, pred_traj_gt, loss_mask, random=0, mode='average'):
     if mode == 'sum':
         return torch.sum(loss)
     elif mode == 'average':
-        return torch.sum(loss) / torch.numel(loss_mask.data)
+        return torch.sum(loss) / torch.numel(loss_mask)
     elif mode == 'raw':
         return loss.sum(dim=2).sum(dim=1)
 

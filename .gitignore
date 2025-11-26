@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Checkpoints and logs
+*.pt
+*.pth
+checkpoints/
+logs/
+
+# Downloaded datasets and models
+datasets/
+models/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.egg-info

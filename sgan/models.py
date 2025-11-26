@@ -17,11 +17,11 @@ def make_mlp(dim_list, activation='relu', batch_norm=True, dropout=0):
     return nn.Sequential(*layers)
 
 
-def get_noise(shape, noise_type):
+def get_noise(shape, noise_type, device):
     if noise_type == 'gaussian':
-        return torch.randn(*shape).cuda()
+        return torch.randn(*shape, device=device)
     elif noise_type == 'uniform':
-        return torch.rand(*shape).sub_(0.5).mul_(2.0).cuda()
+        return torch.rand(*shape, device=device).sub_(0.5).mul_(2.0)
     raise ValueError('Unrecognized noise type "%s"' % noise_type)
 
 
@@ -45,10 +45,10 @@ class Encoder(nn.Module):
 
         self.spatial_embedding = nn.Linear(2, embedding_dim)
 
-    def init_hidden(self, batch):
+    def init_hidden(self, batch, device):
         return (
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda(),
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda()
+            torch.zeros(self.num_layers, batch, self.h_dim, device=device),
+            torch.zeros(self.num_layers, batch, self.h_dim, device=device)
         )
 
     def forward(self, obs_traj):
@@ -60,11 +60,12 @@ class Encoder(nn.Module):
         """
         # Encode observed Trajectory
         batch = obs_traj.size(1)
-        obs_traj_embedding = self.spatial_embedding(obs_traj.view(-1, 2))
+        obs_traj_embedding = self.spatial_embedding(obs_traj.reshape(-1, 2))
         obs_traj_embedding = obs_traj_embedding.view(
             -1, batch, self.embedding_dim
         )
-        state_tuple = self.init_hidden(batch)
+        device = obs_traj.device
+        state_tuple = self.init_hidden(batch, device)
         output, state = self.encoder(obs_traj_embedding, state_tuple)
         final_h = state[0]
         return final_h
@@ -357,7 +358,8 @@ class TrajectoryGenerator(nn.Module):
         decoder_h_dim=128, mlp_dim=1024, num_layers=1, noise_dim=(0, ),
         noise_type='gaussian', noise_mix_type='ped', pooling_type=None,
         pool_every_timestep=True, dropout=0.0, bottleneck_dim=1024,
-        activation='relu', batch_norm=True, neighborhood_size=2.0, grid_size=8
+        activation='relu', batch_norm=True, neighborhood_size=2.0, grid_size=8,
+        cond_len=6
     ):
         super(TrajectoryGenerator, self).__init__()
 
@@ -378,6 +380,8 @@ class TrajectoryGenerator(nn.Module):
         self.noise_first_dim = 0
         self.pool_every_timestep = pool_every_timestep
         self.bottleneck_dim = 1024
+        self.cond_len = cond_len
+        self.condition_dim = encoder_h_dim
 
         self.encoder = Encoder(
             embedding_dim=embedding_dim,
@@ -422,10 +426,13 @@ class TrajectoryGenerator(nn.Module):
                 grid_size=grid_size
             )
 
-        if self.noise_dim[0] == 0:
-            self.noise_dim = None
+        if self.noise_dim:
+            if self.noise_dim[0] == 0:
+                self.noise_dim = None
+            else:
+                self.noise_first_dim = noise_dim[0]
         else:
-            self.noise_first_dim = noise_dim[0]
+            self.noise_dim = None
 
         # Decoder Hidden
         if pooling_type:
@@ -435,7 +442,9 @@ class TrajectoryGenerator(nn.Module):
 
         if self.mlp_decoder_needed():
             mlp_decoder_context_dims = [
-                input_dim, mlp_dim, decoder_h_dim - self.noise_first_dim
+                input_dim + self.condition_dim,
+                mlp_dim,
+                decoder_h_dim - self.noise_first_dim
             ]
 
             self.mlp_decoder_context = make_mlp(
@@ -464,9 +473,9 @@ class TrajectoryGenerator(nn.Module):
             noise_shape = (_input.size(0), ) + self.noise_dim
 
         if user_noise is not None:
-            z_decoder = user_noise
+            z_decoder = user_noise.to(_input.device)
         else:
-            z_decoder = get_noise(noise_shape, self.noise_type)
+            z_decoder = get_noise(noise_shape, self.noise_type, _input.device)
 
         if self.noise_mix_type == 'global':
             _list = []
@@ -486,26 +495,46 @@ class TrajectoryGenerator(nn.Module):
     def mlp_decoder_needed(self):
         if (
             self.noise_dim or self.pooling_type or
-            self.encoder_h_dim != self.decoder_h_dim
+            self.encoder_h_dim != self.decoder_h_dim or self.condition_dim
         ):
             return True
         else:
             return False
 
-    def forward(self, obs_traj, obs_traj_rel, seq_start_end, user_noise=None):
+    def forward(
+        self,
+        obs_traj,
+        obs_traj_rel,
+        seq_start_end,
+        subj_obs,
+        subj_obs_rel,
+        subj_fut,
+        subj_fut_rel,
+        obj_seq_ids,
+        user_noise=None
+    ):
         """
         Inputs:
-        - obs_traj: Tensor of shape (obs_len, batch, 2)
-        - obs_traj_rel: Tensor of shape (obs_len, batch, 2)
-        - seq_start_end: A list of tuples which delimit sequences within batch.
+        - obs_traj: Tensor of shape (obs_len, total_obj, 2)
+        - obs_traj_rel: Tensor of shape (obs_len, total_obj, 2)
+        - seq_start_end: Tuples delimiting object sequences within batch
+        - subj_obs: Tensor of shape (obs_len, num_seq, 2)
+        - subj_obs_rel: Tensor of shape (obs_len, num_seq, 2)
+        - subj_fut: Tensor of shape (cond_len, num_seq, 2)
+        - subj_fut_rel: Tensor of shape (cond_len, num_seq, 2)
+        - obj_seq_ids: Tensor mapping each object to its sequence id
         - user_noise: Generally used for inference when you want to see
         relation between different types of noise and outputs.
         Output:
-        - pred_traj_rel: Tensor of shape (self.pred_len, batch, 2)
+        - pred_traj_rel: Tensor of shape (self.pred_len, total_obj, 2)
         """
+        device = obs_traj.device
         batch = obs_traj_rel.size(1)
         # Encode seq
         final_encoder_h = self.encoder(obs_traj_rel)
+        subj_cat = torch.cat([subj_obs_rel, subj_fut_rel], dim=0)
+        subj_h = self.encoder(subj_cat)
+        subj_ctx = subj_h.view(-1, self.encoder_h_dim)[obj_seq_ids]
         # Pool States
         if self.pooling_type:
             end_pos = obs_traj[-1, :, :]
@@ -516,6 +545,10 @@ class TrajectoryGenerator(nn.Module):
         else:
             mlp_decoder_context_input = final_encoder_h.view(
                 -1, self.encoder_h_dim)
+
+        mlp_decoder_context_input = torch.cat(
+            [mlp_decoder_context_input, subj_ctx], dim=1
+        )
 
         # Add Noise
         if self.mlp_decoder_needed():
@@ -528,7 +561,7 @@ class TrajectoryGenerator(nn.Module):
 
         decoder_c = torch.zeros(
             self.num_layers, batch, self.decoder_h_dim
-        ).cuda()
+        ).to(device)
 
         state_tuple = (decoder_h, decoder_c)
         last_pos = obs_traj[-1]

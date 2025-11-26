@@ -11,7 +11,7 @@ This will create the directory `datasets/<dataset_name>` with train/ val/ and te
 
 ## Step 2: Train a model
 
-Now you can train a new model by running the script:
+Now you can train a new model by running the script (device defaults to auto-detect; override with `--device mps` on Apple Silicon, `--device cuda`, or `--use_gpu 0` for CPU):
 
 ```bash
 python scripts/train.py
